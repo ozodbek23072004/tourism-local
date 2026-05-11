@@ -1,0 +1,31 @@
+<IfModule mod_rewrite.c>
+RewriteEngine On
+
+# Block direct access to the includes directory
+RewriteRule ^includes/ - [F,L,NC]
+RewriteRule ^public/includes/ - [F,L,NC]
+RewriteRule ^admin/includes/ - [F,L,NC]
+
+# Block PHP execution in uploads (critical security)
+RewriteRule ^(public/)?uploads/.*\.(php|phtml|php3|php4|php5|phar|shtml)$ - [F,L,NC]
+
+# Block direct access to scratch/seed scripts
+RewriteRule ^scratch/ - [F,L,NC]
+</IfModule>
+
+# Security headers
+<IfModule mod_headers.c>
+    Header set X-Content-Type-Options "nosniff"
+    Header set X-Frame-Options "SAMEORIGIN"
+    Header set X-XSS-Protection "1; mode=block"
+    Header set Referrer-Policy "strict-origin-when-cross-origin"
+</IfModule>
+
+# Disable directory listing
+Options -Indexes
+
+# PHP errors off in production (set in config.php too, belt-and-suspenders)
+<IfModule mod_php.c>
+    php_flag display_errors Off
+    php_flag log_errors On
+</IfModule>

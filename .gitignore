@@ -1,0 +1,12 @@
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Project-specific files
+.gemini/
+uploads/cache/
+*.log
+
+# Databases (optional, but often ignored if they are huge or sensitive)
+# database.sql
+# database_migrations_v6.sql

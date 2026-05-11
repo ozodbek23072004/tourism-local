@@ -1,0 +1,320 @@
+<?php
+require_once '../../includes/config.php';
+require_once '../../includes/db.php';
+require_once '../../includes/auth.php';
+require_once '../../includes/functions.php';
+require_once '../../public/includes/image.php';
+
+requireAuth();
+
+$id = $_GET['id'] ?? null;
+if (!$id) redirect('index.php');
+
+$stmt = $pdo->prepare("SELECT * FROM places WHERE id = ?");
+$stmt->execute([$id]);
+$place = $stmt->fetch();
+if (!$place) {
+    http_response_code(404);
+    $pageTitle = "Sahifa topilmadi";
+    require_once __DIR__ . '/../../includes/layout_header.php';
+    echo '<div class="p-8 text-center text-gray-500">Yozuv topilmadi (#404)</div>';
+    require_once __DIR__ . '/../../includes/layout_footer.php';
+    exit;
+}
+
+$errors = [];
+$uploadFolder = getEntityUploadFolder('places', (int)$id);
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    verifyCsrf();
+
+    // === GALEREYA RASM QO'SHISH (ko'p rasmli) ===
+    if (isset($_POST['add_gallery'])) {
+        $currentCount = getGalleryCount($pdo, 'place', (int)$id);
+        
+        if ($currentCount >= 10) {
+            flashMessage('error', "Galereya limiti (10 ta) to'lgan! Avval eski rasmlarni o'chiring.");
+        } else {
+            $remainingSlots = 10 - $currentCount;
+            $uploaded = 0;
+            
+            // Ko'p rasmli yuklash
+            if (isset($_FILES['gallery_images']) && is_array($_FILES['gallery_images']['name'])) {
+                $paths = uploadMultipleImages('gallery_images', 'gallery/' . $uploadFolder, $remainingSlots);
+                foreach ($paths as $path) {
+                    addGalleryImage($pdo, 'place', (int)$id, $path);
+                    $uploaded++;
+                }
+            }
+            // Bitta rasm yuklash (eski format uchun moslik)
+            elseif (isset($_FILES['gallery_image']) && $_FILES['gallery_image']['error'] !== UPLOAD_ERR_NO_FILE) {
+                $galleryPath = uploadImage('gallery_image', 'gallery/' . $uploadFolder);
+                if ($galleryPath) {
+                    addGalleryImage($pdo, 'place', (int)$id, $galleryPath);
+                    $uploaded = 1;
+                }
+            }
+            
+            if ($uploaded > 0) {
+                flashMessage('success', "$uploaded ta galereya rasmi qo'shildi!");
+            } else {
+                global $uploadError;
+                flashMessage('error', "Galereya rasmi yuklanmadi: " . ($uploadError ?: "Hech qanday rasm tanlanmagan."));
+            }
+        }
+        redirect("edit.php?id=$id");
+    }
+
+    // === VIDEO YUKLASH ===
+    if (isset($_POST['upload_video'])) {
+        if (isset($_FILES['video_file']) && $_FILES['video_file']['error'] !== UPLOAD_ERR_NO_FILE) {
+            $videoPath = uploadVideo('video_file', 'videos/' . $uploadFolder);
+            if ($videoPath) {
+                $videoUrl = BASE_URL . 'uploads/' . $videoPath;
+                $pdo->prepare("UPDATE places SET video_url = ? WHERE id = ?")->execute([$videoUrl, $id]);
+                flashMessage('success', "Video muvaffaqiyatli yuklandi!");
+            } else {
+                flashMessage('error', "Video yuklashda xatolik! Faqat MP4/WebM, max 50MB.");
+            }
+        }
+        elseif (!empty($_POST['video_url'])) {
+            $videoUrl = sanitize($_POST['video_url']);
+            $pdo->prepare("UPDATE places SET video_url = ? WHERE id = ?")->execute([$videoUrl, $id]);
+            flashMessage('success', "Video havola saqlandi!");
+        }
+        redirect("edit.php?id=$id");
+    }
+
+    // === VIDEO O'CHIRISH ===
+    if (isset($_POST['delete_video'])) {
+        $pdo->prepare("UPDATE places SET video_url = NULL WHERE id = ?")->execute([$id]);
+        flashMessage('success', "Video o'chirildi!");
+        redirect("edit.php?id=$id");
+    }
+
+    // === ASOSIY MA'LUMOTLAR ===
+    if (!isset($_POST['add_gallery']) && !isset($_POST['upload_video']) && !isset($_POST['delete_video'])) {
+        $place['name_uz']        = sanitize($_POST['name_uz'] ?? '');
+        $place['name_ru']        = sanitize($_POST['name_ru'] ?? '');
+        $place['name_en']        = sanitize($_POST['name_en'] ?? '');
+        $place['description_uz'] = cleanText($_POST['description_uz'] ?? '');
+        $place['description_ru'] = cleanText($_POST['description_ru'] ?? '');
+        $place['description_en'] = cleanText($_POST['description_en'] ?? '');
+        $place['category_id']    = sanitize($_POST['category_id'] ?? '');
+        $place['region_id']      = sanitize($_POST['region_id'] ?? '');
+        $place['address']        = sanitize($_POST['address'] ?? '');
+        $place['status']         = in_array($_POST['status'] ?? '', ['active', 'draft']) ? $_POST['status'] : 'draft';
+
+        $map_link = trim($_POST['map_link'] ?? '');
+        if ($map_link !== '') {
+            $coords = parseGoogleMapsUrl($map_link);
+            if ($coords) {
+                $place['latitude'] = $coords['lat'];
+                $place['longitude'] = $coords['lng'];
+            } else {
+                $errors['map_link'] = "Google Maps havolasi noto'g'ri yoki koordinata topilmadi.";
+            }
+        } else {
+            $place['latitude'] = null;
+            $place['longitude'] = null;
+        }
+
+        $rules = [
+            'name_uz'   => 'required|max:255'
+        ];
+        $errors = validate($rules, $place);
+
+        // Asosiy rasm
+        $imagePath = $place['image'];
+        if (isset($_FILES['image']) && $_FILES['image']['error'] !== UPLOAD_ERR_NO_FILE) {
+            $upload = uploadImage('image', $uploadFolder);
+            if ($upload) {
+                if (!empty($place['image']) && !filter_var($place['image'], FILTER_VALIDATE_URL)) {
+                    deleteImage($place['image']);
+                }
+                $imagePath = $upload;
+            } else {
+                global $uploadError;
+                $errors['image'] = "Rasm yuklashda xatolik: " . ($uploadError ?: 'Noma\'lum xato');
+            }
+        }
+
+        if (empty($errors)) {
+            $stmt = $pdo->prepare("UPDATE places SET name_uz=?, name_ru=?, name_en=?, description_uz=?, description_ru=?, description_en=?, category_id=?, region_id=?, address=?, latitude=?, longitude=?, image=?, status=? WHERE id=?");
+            $stmt->execute([
+                $place['name_uz'], $place['name_ru'], $place['name_en'],
+                $place['description_uz'], $place['description_ru'], $place['description_en'],
+                $place['category_id'] !== '' ? $place['category_id'] : null,
+                $place['region_id']  !== '' ? $place['region_id']  : null,
+                $place['address'],
+                $place['latitude']   !== '' ? $place['latitude']   : null,
+                $place['longitude']  !== '' ? $place['longitude']  : null,
+                $imagePath, $place['status'], $id
+            ]);
+            clearPublicCache();
+            flashMessage('success', "Joy muvaffaqiyatli tahrirlandi!");
+            redirect('index.php');
+        }
+    }
+}
+
+// === GALEREYA RASM O'CHIRISH ===
+if (isset($_GET['delete_gallery'])) {
+    $gid = (int)$_GET['delete_gallery'];
+    deleteGalleryImage($pdo, $gid, 'place', (int)$id);
+    flashMessage('success', "Galereya rasmi o'chirildi!");
+    redirect("edit.php?id=$id");
+}
+
+// Ma'lumot olish
+$place = $pdo->prepare("SELECT * FROM places WHERE id = ?")->fetch() ?: $place;
+$stmtCat = $pdo->prepare("SELECT id, name_uz FROM categories ORDER BY name_uz"); $stmtCat->execute(); $categories = $stmtCat->fetchAll();
+$stmtReg = $pdo->prepare("SELECT id, name_uz FROM regions ORDER BY name_uz"); $stmtReg->execute(); $regions = $stmtReg->fetchAll();
+$gallery = getEntityGallery($pdo, 'place', (int)$id);
+$galleryCount = count($gallery);
+
+$pageTitle = "Joyni tahrirlash: " . htmlspecialchars($place['name_uz']);
+require_once '../../includes/layout_header.php';
+
+// Flash messages
+$flashSuccess = getFlash('success');
+$flashError = getFlash('error');
+?>
+
+<?php if ($flashSuccess): ?>
+<div class="bg-green-50 border border-green-200 text-green-700 px-4 py-3 rounded-lg mb-4 flex items-center gap-2">
+    <span class="material-symbols-outlined text-lg">check_circle</span> <?= htmlspecialchars($flashSuccess) ?>
+</div>
+<?php endif; ?>
+<?php if ($flashError): ?>
+<div class="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg mb-4 flex items-center gap-2">
+    <span class="material-symbols-outlined text-lg">error</span> <?= htmlspecialchars($flashError) ?>
+</div>
+<?php endif; ?>
+
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+    <!-- CHAP USTUN: Asosiy ma'lumotlar -->
+    <div class="lg:col-span-2">
+        <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6 md:p-8">
+            <h2 class="text-xl font-bold text-gray-800 mb-6 flex items-center gap-2">
+                <span class="material-symbols-outlined text-blue-500">edit_note</span>
+                Asosiy ma'lumotlar
+            </h2>
+            <form action="" method="POST" enctype="multipart/form-data">
+                <?php require_once '../../includes/places_form.php'; ?>
+                <div class="mt-6 pt-6 border-t border-gray-100">
+                    <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2.5 px-6 rounded-lg transition-colors">Saqlash</button>
+                    <a href="index.php" class="ml-4 text-gray-500 hover:text-gray-800 font-medium">Bekor qilish</a>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- O'NG USTUN: Media boshqaruvi -->
+    <div class="space-y-6">
+        <!-- Joriy rasm -->
+        <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+            <h3 class="text-sm font-bold text-gray-800 uppercase tracking-wider mb-4 flex items-center gap-2">
+                <span class="material-symbols-outlined text-green-500 text-lg">image</span> Joriy rasm
+            </h3>
+            <div class="aspect-video rounded-lg overflow-hidden bg-gray-100 border border-gray-200">
+                <img src="<?= publicImage($place['image'], $place['name_uz']) ?>" class="w-full h-full object-cover">
+            </div>
+            <?php if (!empty($place['image'])): ?>
+            <p class="text-xs text-gray-400 mt-2 truncate" title="<?= htmlspecialchars($place['image']) ?>">📁 <?= htmlspecialchars($place['image']) ?></p>
+            <?php else: ?>
+            <p class="text-xs text-orange-500 mt-2">⚠️ Rasm yuklanmagan (placeholder ko'rsatilmoqda)</p>
+            <?php endif; ?>
+        </div>
+
+        <!-- Video boshqaruvi -->
+        <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+            <h3 class="text-sm font-bold text-gray-800 uppercase tracking-wider mb-4 flex items-center gap-2">
+                <span class="material-symbols-outlined text-red-500 text-lg">play_circle</span> Video
+            </h3>
+            <?php if (!empty($place['video_url'])): ?>
+            <div class="aspect-video rounded-lg overflow-hidden bg-black mb-3">
+                <?php if (strpos($place['video_url'], 'youtube.com') !== false || strpos($place['video_url'], 'youtu.be') !== false):
+                    preg_match('%(?:youtube(?:-nocookie)?\.com/(?:[^/]+/.+/|(?:v|e(?:mbed)?)/|.*[?&]v=)|youtu\.be/)([^"&?/ ]{11})%i', $place['video_url'], $m);
+                    $ytId = $m[1] ?? '';
+                ?>
+                    <iframe width="100%" height="100%" src="https://www.youtube.com/embed/<?= $ytId ?>" frameborder="0" allowfullscreen></iframe>
+                <?php else: ?>
+                    <video controls class="w-full h-full"><source src="<?= htmlspecialchars($place['video_url']) ?>" type="video/mp4"></video>
+                <?php endif; ?>
+            </div>
+            <form action="" method="POST" class="inline">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(generateCsrf()) ?>">
+                <button type="submit" name="delete_video" class="text-red-500 text-xs hover:text-red-700 font-semibold" onclick="return confirm('Video o\'chirilsinmi?')">🗑 Videoni o'chirish</button>
+            </form>
+            <?php else: ?>
+            <form action="" method="POST" enctype="multipart/form-data" class="space-y-3">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(generateCsrf()) ?>">
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1">Video fayl yuklash (MP4/WebM, max 50MB)</label>
+                    <input type="file" name="video_file" accept="video/mp4,video/webm" class="text-xs file:bg-red-50 file:text-red-700 file:border-0 file:rounded-lg file:px-3 file:py-1.5 w-full">
+                </div>
+                <div class="flex items-center gap-2 text-xs text-gray-400">
+                    <div class="flex-1 h-px bg-gray-200"></div> yoki <div class="flex-1 h-px bg-gray-200"></div>
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 mb-1">YouTube / tashqi havola</label>
+                    <input type="text" name="video_url" placeholder="https://www.youtube.com/watch?v=..." class="w-full px-3 py-2 border rounded-lg text-sm focus:ring-blue-500 outline-none border-gray-300">
+                </div>
+                <button type="submit" name="upload_video" class="w-full bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg text-xs font-bold transition-colors">🎬 Video qo'shish</button>
+            </form>
+            <?php endif; ?>
+        </div>
+
+        <!-- Galereya (10 tagacha rasm) -->
+        <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+            <h3 class="text-sm font-bold text-gray-800 uppercase tracking-wider mb-4 flex items-center justify-between">
+                <span class="flex items-center gap-2">
+                    <span class="material-symbols-outlined text-purple-500 text-lg">photo_library</span> Galereya
+                </span>
+                <span class="text-xs font-normal px-2 py-0.5 rounded-full <?= $galleryCount >= 10 ? 'bg-red-100 text-red-600' : 'bg-purple-100 text-purple-600' ?>">
+                    <?= $galleryCount ?>/10
+                </span>
+            </h3>
+            
+            <?php if ($galleryCount < 10): ?>
+            <form action="" method="POST" enctype="multipart/form-data" class="mb-4 pb-4 border-b border-gray-100">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars(generateCsrf()) ?>">
+                <label class="block text-xs font-medium text-gray-600 mb-2">Yangi rasm qo'shish (<?= 10 - $galleryCount ?> ta joy qoldi)</label>
+                <div class="space-y-2">
+                    <input type="file" name="gallery_images[]" accept="image/*" multiple 
+                           class="text-xs file:bg-purple-50 file:text-purple-700 file:border-0 file:rounded-lg file:px-3 file:py-1.5 w-full">
+                    <p class="text-[10px] text-gray-400">Bir nechta rasm tanlash mumkin (max <?= 10 - $galleryCount ?> ta)</p>
+                    <button type="submit" name="add_gallery" class="w-full bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg text-xs font-bold transition-colors">
+                        📸 Yuklash
+                    </button>
+                </div>
+            </form>
+            <?php else: ?>
+            <div class="mb-4 pb-4 border-b border-gray-100">
+                <p class="text-xs text-red-500 bg-red-50 px-3 py-2 rounded-lg text-center">⚠️ Galereya limiti (10 ta) to'lgan</p>
+            </div>
+            <?php endif; ?>
+            
+            <div class="grid grid-cols-2 gap-3">
+                <?php if (empty($gallery)): ?>
+                    <p class="col-span-2 text-center text-gray-400 text-xs py-4 italic">Rasmlar yo'q</p>
+                <?php else: ?>
+                    <?php foreach ($gallery as $g): ?>
+                        <div class="relative group aspect-square rounded-lg overflow-hidden border border-gray-100">
+                            <img src="<?= publicImage($g['image_path']) ?>" class="w-full h-full object-cover">
+                            <a href="?id=<?= $id ?>&delete_gallery=<?= $g['id'] ?>" class="absolute top-1 right-1 w-6 h-6 bg-red-500 text-white rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-lg" onclick="return confirm('O\'chirilsinmi?')">
+                                <span class="material-symbols-outlined text-xs">close</span>
+                            </a>
+                            <div class="absolute bottom-0 left-0 right-0 bg-black/50 text-white text-[9px] px-1.5 py-0.5 opacity-0 group-hover:opacity-100 transition-opacity truncate">
+                                #<?= $g['sort_order'] ?? $g['id'] ?>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+</div>
+
+<?php require_once '../../includes/layout_footer.php'; ?>
